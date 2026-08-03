@@ -2583,8 +2583,20 @@ func (t *Torrent) wantOutgoingConns() bool {
 	}) != nil
 }
 
+// Accept incoming connections while piece hashing is queued or running even though
+// newConnsAllowed is false: completion state hasn't settled, so the torrent can't know what it
+// wants yet. Rejecting the dialer now loses the peer permanently, because it was already popped
+// from the dialer's pending queue and failed handshakes aren't retried. The connection idles until
+// verification finishes.
+func (t *Torrent) wantConnsDuringVerification() bool {
+	if !t.networkingEnabled.Bool() || t.closed.IsSet() {
+		return false
+	}
+	return t.activePieceHashes != 0 || !t.piecesQueuedForHash.IsEmpty()
+}
+
 func (t *Torrent) wantIncomingConns() bool {
-	if !t.newConnsAllowed() {
+	if !t.newConnsAllowed() && !t.wantConnsDuringVerification() {
 		return false
 	}
 	if len(t.conns) < t.maxEstablishedConns {
