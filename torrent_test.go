@@ -2,12 +2,15 @@ package torrent
 
 import (
 	"context"
+	"expvar"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	g "github.com/anacrolix/generics"
 	"github.com/anacrolix/missinggo/v2"
@@ -245,4 +248,197 @@ func TestRelativeAvailabilityHaveNone(t *testing.T) {
 	qt.Assert(t, qt.IsNil(err))
 	tt.Drop()
 	tt.assertAllPiecesRelativeAvailabilityZero()
+}
+
+// Wraps a storage.ClientImpl so that piece reads signal when initial hashing begins and then block
+// until released. This holds a torrent in its initial piece-verification window for as long as the
+// test needs, making the connection-rejection window deterministic.
+type hashBlockingStorage struct {
+	inner       storage.ClientImpl
+	readStarted chan struct{}
+	release     chan struct{}
+	startedOnce sync.Once
+}
+
+func (me *hashBlockingStorage) OpenTorrent(
+	ctx context.Context,
+	info *metainfo.Info,
+	infoHash metainfo.Hash,
+) (storage.TorrentImpl, error) {
+	t, err := me.inner.OpenTorrent(ctx, info, infoHash)
+	if err != nil {
+		return t, err
+	}
+	if inner := t.PieceWithHash; inner != nil {
+		t.PieceWithHash = func(p metainfo.Piece, pieceHash g.Option[[]byte]) storage.PieceImpl {
+			return &hashBlockingPiece{inner(p, pieceHash), me}
+		}
+	}
+	if inner := t.Piece; inner != nil {
+		t.Piece = func(p metainfo.Piece) storage.PieceImpl {
+			return &hashBlockingPiece{inner(p), me}
+		}
+	}
+	// Force all reads through PieceImpl.ReadAt so they can be blocked.
+	t.NewReader = nil
+	t.NewPieceReader = nil
+	return t, nil
+}
+
+// The wrapper deliberately exposes only the plain PieceImpl method set: optimized read paths
+// (io.WriterTo, storage.PieceReaderer, storage.SelfHashing) on the wrapped piece must not be
+// visible, or hashing would bypass the blocking ReadAt.
+type hashBlockingPiece struct {
+	storage.PieceImpl
+	s *hashBlockingStorage
+}
+
+func (me *hashBlockingPiece) ReadAt(b []byte, off int64) (int, error) {
+	me.s.startedOnce.Do(func() { close(me.s.readStarted) })
+	<-me.s.release
+	return me.PieceImpl.ReadAt(b, off)
+}
+
+func rejectedAcceptedConnsValue() int64 {
+	if v := torrent.Get("rejected accepted connections"); v != nil {
+		return v.(*expvar.Int).Value()
+	}
+	return 0
+}
+
+// A peer added while the remote torrent is still performing its initial piece verification must
+// not be lost. The dialing torrent pops the peer from its pending queue and never retries a failed
+// handshake, so a pre-handshake rejection leaves no peer to contact and the download stalls
+// forever.
+func TestPeerLostAfterRejectionDuringInitialVerification(t *testing.T) {
+	testPeerAddedDuringInitialVerification(t, false)
+}
+
+// Same scenario with AlwaysWantConns on the seeder: it accepts the connection during initial
+// verification and the download completes. Guards that escape hatch against regressions.
+func TestAlwaysWantConnsAllowsPeerDuringInitialVerification(t *testing.T) {
+	testPeerAddedDuringInitialVerification(t, true)
+}
+
+// A seeder verifying pre-existing data has its first hash read blocked, holding it in the
+// initial-verification window. During that window a leecher is given the seeder as its only peer,
+// exactly once. Once the window closes the download must still complete, whether the seeder
+// accepted the connection during verification or the leecher retries the peer later.
+func testPeerAddedDuringInitialVerification(t *testing.T, seederAlwaysWantConns bool) {
+	greetingTempDir, mi := testutil.GreetingTestTorrent()
+	defer os.RemoveAll(greetingTempDir)
+
+	// Part files disabled so piece completion cannot be inferred from file presence: the seeder
+	// must hash the existing data, opening the initial-verification window this test targets.
+	fileStorage := storage.NewFileOpts(storage.NewFileClientOpts{
+		ClientBaseDir:   greetingTempDir,
+		PieceCompletion: storage.NewMapPieceCompletion(),
+		UsePartFiles:    g.Some(false),
+	})
+	defer fileStorage.Close()
+	seederStorage := &hashBlockingStorage{
+		inner:       fileStorage,
+		readStarted: make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(seederStorage.release) }) }
+
+	cfg := TestingConfig(t)
+	cfg.Seed = true
+	cfg.DataDir = greetingTempDir
+	cfg.DefaultStorage = seederStorage
+	cfg.DisableUTP = true
+	cfg.DisablePEX = true
+	cfg.AlwaysWantConns = seederAlwaysWantConns
+	seeder, err := NewClient(cfg)
+	qt.Assert(t, qt.IsNil(err))
+	defer seeder.Close()
+	// Registered after seeder.Close so blocked piece hashers are released before the client shuts
+	// down, whichever way the test exits.
+	defer release()
+
+	rejectedBefore := rejectedAcceptedConnsValue()
+
+	seederTorrent, isNew, err := seeder.AddTorrentSpec(TorrentSpecFromMetaInfo(mi))
+	qt.Assert(t, qt.IsNil(err))
+	qt.Assert(t, qt.IsTrue(isNew))
+
+	// Initial verification has started reading piece data and is now blocked. Until it completes,
+	// the seeder has needData()==false and haveAnyPieces()==false, so it rejects incoming
+	// connections.
+	select {
+	case <-seederStorage.readStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the seeder to start verifying pieces")
+	}
+	qt.Assert(t, qt.IsFalse(seederTorrent.Complete().Bool()))
+
+	cfg = TestingConfig(t)
+	cfg.Seed = false
+	cfg.DataDir = t.TempDir()
+	cfg.DisableUTP = true
+	cfg.DisablePEX = true
+	leecher, err := NewClient(cfg)
+	qt.Assert(t, qt.IsNil(err))
+	defer leecher.Close()
+
+	leecherTorrent, isNew, err := leecher.AddTorrentSpec(TorrentSpecFromMetaInfo(mi))
+	qt.Assert(t, qt.IsNil(err))
+	qt.Assert(t, qt.IsTrue(isNew))
+	leecherTorrent.DownloadAll()
+
+	// The seeder is the only peer the leecher will ever hear about: DHT, trackers, PEX and uTP are
+	// all disabled, so there is no rediscovery mechanism.
+	added := leecherTorrent.AddClientPeer(seeder)
+	qt.Assert(t, qt.Not(qt.Equals(added, 0)))
+
+	// Make sure the connection attempt happens while the seeder is still verifying, and reaches a
+	// conclusion before verification is allowed to finish. Either the seeder accepts the
+	// connection during verification (one acceptable fix), or it rejects it and all of the
+	// leecher's attempts for the peer conclude (half-open drains) before the window closes.
+	settleDeadline := time.Now().Add(10 * time.Second)
+	for {
+		stats := leecherTorrent.Stats()
+		if stats.ActivePeers > 0 {
+			break
+		}
+		if rejectedAcceptedConnsValue() > rejectedBefore &&
+			stats.HalfOpenPeers == 0 {
+			break
+		}
+		if time.Now().After(settleDeadline) {
+			t.Fatalf(
+				"timed out waiting for a connection attempt during verification; leecher gauges: %+v",
+				stats.TorrentGauges,
+			)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Let the seeder finish its initial verification. From here on it would happily serve data.
+	release()
+	select {
+	case <-seederTorrent.Complete().On():
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the seeder to finish verifying")
+	}
+
+	// The peer the leecher was given was only temporarily unavailable, so the download should
+	// still complete without the peer being added again. With the current behavior the leecher
+	// never retries the popped peer and stalls with zero peers.
+	done := make(chan struct{})
+	go func() {
+		leecher.WaitAll()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		stats := leecherTorrent.Stats()
+		t.Fatalf(
+			"leecher stalled: its only peer was dropped after rejection during the seeder's initial verification and never retried; gauges: %+v, useful bytes read: %v",
+			stats.TorrentGauges, stats.BytesReadUsefulData.Int64(),
+		)
+	}
 }
