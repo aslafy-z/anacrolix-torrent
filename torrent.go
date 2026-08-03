@@ -2545,7 +2545,34 @@ func (t *Torrent) addPeerConn(c *PeerConn) (err error) {
 	return nil
 }
 
-func (t *Torrent) newConnsAllowed() bool {
+// Why a torrent would hold peer connections.
+type connDemand int
+
+const (
+	// Nothing to download and nothing to offer.
+	connDemandNone connDemand = iota
+	// Piece hashing is queued or active, so completion state (and real demand) isn't known yet.
+	connDemandUnknown
+	// Wants piece data.
+	connDemandDownload
+	// Seeding and has pieces to offer.
+	connDemandSeed
+)
+
+// Only settled demand justifies dialing out: a verifying torrent shouldn't start contacting peers.
+func (d connDemand) justifiesDialing() bool {
+	return d == connDemandDownload || d == connDemandSeed
+}
+
+// Unlike dialing, unknown demand justifies accepting: rejecting a dialer during initial
+// verification loses the peer permanently, because it was already popped from the dialer's
+// pending queue and failed handshakes aren't retried. The connection idles until hashing settles.
+func (d connDemand) justifiesAccepting() bool {
+	return d != connDemandNone
+}
+
+// Whether new connections are possible at all, regardless of demand.
+func (t *Torrent) connsGateOpen() bool {
 	if !t.networkingEnabled.Bool() {
 		return false
 	}
@@ -2555,47 +2582,75 @@ func (t *Torrent) newConnsAllowed() bool {
 	if rl := t.cl.config.DownloadRateLimiter; rl != nil && rl.Tokens() <= 0 {
 		return false
 	}
+	return true
+}
+
+// Definite reasons win over Unknown: some pieces can still be hashing while others already need
+// data or are seedable.
+func (t *Torrent) currentConnDemand() connDemand {
 	if t.needData() {
+		return connDemandDownload
+	}
+	if t.seeding() && t.haveAnyPieces() {
+		return connDemandSeed
+	}
+	if t.activePieceHashes != 0 || !t.piecesQueuedForHash.IsEmpty() {
+		return connDemandUnknown
+	}
+	return connDemandNone
+}
+
+// A free slot, or a bad connection in the over-represented direction worth replacing.
+func (t *Torrent) haveOutgoingConnCapacity() bool {
+	if len(t.conns) < t.maxEstablishedConns {
 		return true
 	}
-	return t.seeding() && t.haveAnyPieces()
+	numOutgoingConns := t.numOutgoingConns()
+	numIncomingConns := len(t.conns) - numOutgoingConns
+	return t.worstBadConn(worseConnLensOpts{
+		incomingIsBad: numIncomingConns-numOutgoingConns > 1,
+	}) != nil
+}
+
+func (t *Torrent) haveIncomingConnCapacity() bool {
+	if len(t.conns) < t.maxEstablishedConns {
+		return true
+	}
+	numOutgoingConns := t.numOutgoingConns()
+	numIncomingConns := len(t.conns) - numOutgoingConns
+	return t.worstBadConn(worseConnLensOpts{
+		outgoingIsBad: numOutgoingConns-numIncomingConns > 1,
+	}) != nil
 }
 
 func (t *Torrent) wantAnyConns() bool {
-	if !t.newConnsAllowed() {
+	if !t.connsGateOpen() {
+		return false
+	}
+	if !t.currentConnDemand().justifiesDialing() {
 		return false
 	}
 	return len(t.conns) < t.maxEstablishedConns
 }
 
 func (t *Torrent) wantOutgoingConns() bool {
-	if !t.newConnsAllowed() {
+	if !t.connsGateOpen() {
 		return false
 	}
-	if len(t.conns) < t.maxEstablishedConns {
-		// Shortcut: We can take any connection direction right now.
-		return true
+	if !t.currentConnDemand().justifiesDialing() {
+		return false
 	}
-	numIncomingConns := len(t.conns) - t.numOutgoingConns()
-	return t.worstBadConn(worseConnLensOpts{
-		incomingIsBad: numIncomingConns-t.numOutgoingConns() > 1,
-		outgoingIsBad: false,
-	}) != nil
+	return t.haveOutgoingConnCapacity()
 }
 
 func (t *Torrent) wantIncomingConns() bool {
-	if !t.newConnsAllowed() {
+	if !t.connsGateOpen() {
 		return false
 	}
-	if len(t.conns) < t.maxEstablishedConns {
-		// Shortcut: We can take any connection direction right now.
-		return true
+	if !t.currentConnDemand().justifiesAccepting() {
+		return false
 	}
-	numIncomingConns := len(t.conns) - t.numOutgoingConns()
-	return t.worstBadConn(worseConnLensOpts{
-		incomingIsBad: false,
-		outgoingIsBad: t.numOutgoingConns()-numIncomingConns > 1,
-	}) != nil
+	return t.haveIncomingConnCapacity()
 }
 
 func (t *Torrent) SetMaxEstablishedConns(max int) (oldMax int) {
