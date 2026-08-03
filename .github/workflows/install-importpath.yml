@@ -15,6 +15,10 @@ on:
 
 jobs:
   install:
+    # The install fetches the commit from the canonical module path, so it can
+    # only succeed for commits that exist on github.com/anacrolix/torrent.
+    # Forks push commits that don't, so skip there.
+    if: github.repository == 'anacrolix/torrent'
     runs-on: ubuntu-latest
     steps:
       # Deliberately no checkout: running outside any working tree guarantees
