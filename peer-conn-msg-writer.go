@@ -84,6 +84,10 @@ func (cn *peerConnMsgWriter) run(keepAliveTimeout time.Duration) {
 		if cn.closed.IsSet() {
 			return
 		}
+		// Install the wakeup channel before filling the buffer, so a
+		// Broadcast that lands during fillWriteBuffer closes a channel the
+		// select below observes, instead of being dropped. See #1070.
+		writeCond := cn.writeCond.Signaled()
 		cn.fillWriteBuffer()
 		keepAlive := cn.keepAlive()
 		cn.mu.Lock()
@@ -92,8 +96,14 @@ func (cn *peerConnMsgWriter) run(keepAliveTimeout time.Duration) {
 			torrent.Add("written keepalives", 1)
 		}
 		if cn.writeBuffer.Len() == 0 {
-			writeCond := cn.writeCond.Signaled()
 			cn.mu.Unlock()
+			// Wake at the keepalive deadline. If it has already passed (a keepalive wasn't wanted
+			// above), poll again in a full interval.
+			wait := keepAliveTimeout - time.Since(lastWrite)
+			if wait <= 0 {
+				wait = keepAliveTimeout
+			}
+			keepAliveTimer.Reset(wait)
 			select {
 			case <-cn.closed.Done():
 			case <-writeCond:
@@ -136,7 +146,6 @@ func (cn *peerConnMsgWriter) run(keepAliveTimeout time.Duration) {
 		cn.mu.Unlock()
 		frontBuf.pieceDataBytes = 0
 		lastWrite = time.Now()
-		keepAliveTimer.Reset(keepAliveTimeout)
 	}
 }
 
